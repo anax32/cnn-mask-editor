@@ -13,7 +13,7 @@ docker run \
   -v $(pwd)/data:/data \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -e DISPLAY=$DISPLAY \
-  masked \
+  anax32/cnn-mask-editor \
   --images=/data/images/*.png \
   --masks=/data/masks/*.png
 ```
