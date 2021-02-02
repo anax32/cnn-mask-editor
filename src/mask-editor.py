@@ -1,12 +1,16 @@
+import os
 import sys
 import logging
+import json
 
 import numpy as np
 import cv2 as cv
 
+from time import perf_counter as clock
 from os.path import basename
 from datetime import datetime
 
+# setup logging
 logger = logging.getLogger(__name__)
 
 # disable loggers
@@ -17,23 +21,39 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 # global vars
 # FIXME: take a conf file
 WINDOW_TITLE = "mask-edit"
-MASK_COLOUR = (1.0, 0.0, 0.0)
-UNMASK_COLOUR = (0.0, 0.0, 0.0)
+CURRENT_LABEL = 1
+LABEL_BACKGROUND = 0
 SHAPE_COLOUR = (1.0, 1.0, 1.0)
 SHAPE_SIZE = 6
 SHAPE_SIZE_INC = 1
 BLEND_ALPHA = 0.75
 MASK_THRESHOLD = 0.5
+DRAW_MODE = "point" # (point|line)
 
 # initial values of global vars
 mouse_pos = (0, 0)
+line_start_pos = (0, 0)
 source_img = None
 source_msk = None
 display_img = None
 show_help = False
 show_help_timestamp = 0
 
-7
+colourmap = {
+    0: (0.0, 0.0, 0.0),
+    1: (1.0, 1.0, 1.0),
+    2: (1.0, 0.0, 0.0),
+    3: (0.0, 1.0, 0.0),
+    4: (0.0, 0.0, 1.0),
+    5: (1.0, 0.0, 1.0),
+    6: (0.0, 1.0, 1.0),
+    7: (1.0, 1.0, 0.0)
+}
+
+# FIXME: this assumes the key->index mapping is identical
+np_colourmap = np.array([x for x in colourmap.values()])
+
+
 def init():
   """
   create a window
@@ -60,23 +80,39 @@ def blend_in_channel(img_a, img_b):
   return np.dstack([img_b[...,0], img_a[...,1], img_a[...,2]])
 
 
+def blend_with_colourmap(img_a, img_b, colourmap):
+  """
+  blends image and colourmap index to single image
+  img_a: float image of source value
+  img_b: float image of colourmap index
+  colourmap: map of index to colour
+  """
+  assert len(img_b.shape) == 3 and img_b.shape[-1] == 1, "img_b.shape: '%s'" % str(img_b.shape)
+  return blend_images(img_a, np_colourmap[img_b[:, :, 0].astype(int)], 0.5)
+
+
 def on_mousemove(event, x, y, flags, userparam):
   """
   mousemove + ctrl paints the mask
   """
   global mouse_pos
   global source_img, source_msk, display_img
+  global DRAW_MODE
 
   if event == cv.EVENT_MOUSEMOVE:
     mouse_pos = (x, y)
 
     if flags & cv.EVENT_FLAG_SHIFTKEY:
-      colour = UNMASK_COLOUR
+      current_label = LABEL_BACKGROUND
     else:
-      colour = MASK_COLOUR
+      current_label = CURRENT_LABEL
 
-    if flags & cv.EVENT_FLAG_CTRLKEY:
-      cv.circle(source_msk, (x, y), SHAPE_SIZE, colour, -1)
+    if DRAW_MODE == "point":
+      if flags & cv.EVENT_FLAG_CTRLKEY:
+        cv.circle(source_msk, (x, y), SHAPE_SIZE, current_label, -1)
+    elif DRAW_MODE == "line":
+      # line drawing is done in the line-mode keypress handler (keydown())
+      pass
 
 
 def help():
@@ -90,9 +126,13 @@ def help():
     [+] increase shape size
     [-] decrease shape size
     [ ] next image (saves mask)
+    [a] point mode (default)
+    [s] line mode
+    [f] flood fill
     CTRL paint mask
     SHFT unpaint mask
     ESC exit
+    1-10 label value
 """
 
 
@@ -129,6 +169,50 @@ def on_keydown(key):
   def stop_editing():
     raise StopIteration
 
+  def set_current_label(value):
+    global CURRENT_LABEL
+    CURRENT_LABEL = value
+
+  def set_mode_point():
+    """
+    default point drawing mode
+    press CTRL on mousemove to draw
+    """
+    global DRAW_MODE
+    DRAW_MODE="point"
+
+  def set_mode_line():
+    """
+    start drawing in line mode
+    if already in line mode, commit a line to the mask and start anew
+    """
+    global DRAW_MODE, CURRENT_LABEL, SHAPE_SIZE
+    global mouse_pos, line_start_pos
+
+    if DRAW_MODE=="line":
+      # draw the line on the mask
+      cv.line(source_msk, line_start_pos, mouse_pos, CURRENT_LABEL, thickness=SHAPE_SIZE)
+
+    line_start_pos = mouse_pos
+    DRAW_MODE="line"
+
+  def flood_fill():
+    """
+    flood fill a region in the mask
+    FIXME: we really need undo for this!
+    """
+    global CURRENT_LABEL
+    global mouse_pos
+
+    im_mask = source_msk.copy().astype(np.uint8)
+#    mask=np.zeros((im_mask.shape[1]+2, im_mask.shape[0]+2), dtype=np.uint8)
+
+#    mask = (~(im_mask == CURRENT_LABEL)).astype(np.uint8)
+#    mask = cv.copyMakeBorder(mask,1,1,1,1,cv.BORDER_CONSTANT,value=0)
+    im_mask = (source_msk==CURRENT_LABEL).astype(np.uint8)
+    cv.floodFill(im_mask, None, mouse_pos, CURRENT_LABEL)
+    source_msk[im_mask!=0] = CURRENT_LABEL
+
   # function map
   fns = {
     ord(' '): next_image,
@@ -136,7 +220,18 @@ def on_keydown(key):
     ord('-'): decrease_shape_size,
     ord('x'): clear_mask,
     ord('h'): display_help,
-    27: stop_editing
+    27: stop_editing,
+    ord('0'): lambda: set_current_label(0),
+    ord('1'): lambda: set_current_label(1),
+    ord('2'): lambda: set_current_label(2),
+    ord('3'): lambda: set_current_label(3),
+    ord('4'): lambda: set_current_label(4),
+    ord('5'): lambda: set_current_label(5),
+    ord('6'): lambda: set_current_label(6),
+    ord('7'): lambda: set_current_label(7),
+    ord('s'): set_mode_line,
+    ord('a'): set_mode_point,
+    ord('f'): flood_fill
   }
 
   try:
@@ -146,30 +241,124 @@ def on_keydown(key):
     #logger.warning("don't handle '%i'" % key)
     pass
 
-def on_draw():
+def on_draw(output_text):
   """
   redraw the image
   """
+  from random import shuffle
+
   global mouse_pos, display_img
-  global SHAPE_SIZE, SHAPE_COLOUR
+  global SHAPE_SIZE #, SHAPE_COLOUR
   global show_help, show_help_timestamp
+  global CURRENT_LABEL
+  global DRAW_MODE, line_start_pos
 
   # draw the outline of the shape onto the display imge
-  display_img = blend_in_channel(source_img, source_msk)
-  cv.circle(display_img, mouse_pos, SHAPE_SIZE, SHAPE_COLOUR, 1)
+  # display_img = blend_in_channel(source_img, source_msk)
+
+  SHAPE_COLOUR = colourmap[CURRENT_LABEL]
+
+  display_img = blend_with_colourmap(source_img, source_msk, colourmap)
+
+  # draw things on the display image to indicate whats happening
+  if DRAW_MODE == "point":
+    cv.circle(display_img, mouse_pos, SHAPE_SIZE, SHAPE_COLOUR, 1)
+  elif DRAW_MODE == "line":
+    cv.line(display_img, line_start_pos, mouse_pos, SHAPE_COLOUR, thickness=SHAPE_SIZE)
+  else:
+    logger.error("unknown draw mode: '%s'" % DRAW_MODE)
 
   if show_help is True:
     if (datetime.now() - show_help_timestamp).seconds > 5:
       show_help = False
 
-    lines = help().split("\n")
-    scale = 0.4
-    text_vscale = scale/0.25 # fudge factor for spacing lines vertically, scale.25 and spacing 1 worked ok)
-    for i, line in enumerate(lines):
-      cv.putText(display_img,
-                 line,
-                 (10, int(i*(10*text_vscale))),
-                 cv.FONT_HERSHEY_SIMPLEX, scale, (255,0,255), 1)
+    output_lines = help().split("\n")
+  elif callable(output_text):
+    output_lines = output_text().split("\n")
+  elif isinstance(output_text, str):
+    # draw normal text
+    output_lines = output_text.split("\n")
+
+  # draw text
+  font = cv.FONT_HERSHEY_SIMPLEX
+  font_scale = 0.4
+  font_thickness = 1
+  font_colour = SHAPE_COLOUR
+  bg_colour = colourmap[LABEL_BACKGROUND if CURRENT_LABEL != LABEL_BACKGROUND else (LABEL_BACKGROUND+1)%len(colourmap)]
+  text_vscale = font_scale/0.25 # fudge factor for spacing lines vertically, scale.25 and spacing 1 worked ok)
+
+  for i, line in enumerate(output_lines):
+    x = 10
+    y = int((i+1)*(10*text_vscale))
+
+    cv.putText(display_img,
+        line,
+        (x, y),
+        font,
+        font_scale,
+        (0,0,0),
+        font_thickness+4
+    )
+
+    cv.putText(display_img,
+        line,
+        (x, y),
+        font,
+        font_scale,
+        font_colour,
+        font_thickness
+    )
+
+
+def read_image(filename):
+  """
+  read an image from disk
+  """
+  return cv.imread(filename).astype(float)/255.0
+
+
+def read_mask(filename):
+  """
+  read a label mask from disk
+
+  all the operations are performed on integer data
+  but the mask is returned as a float array because
+  various opencv operations require a float array
+  input or fail with `Expected Ptr<cv::UMat> for argument 'img'`
+  """
+  # single label images
+  # source_msk = (cv.imread(mask_filename) > 0).astype(np.float)
+  # display_img = blend_in_channel(source_img, source_msk)
+
+  # multi-label images
+  try:
+    source_msk = cv.imread(filename)
+  except FileNotFoundError as e:
+    logger.warning("'%s' not found, creating empty" % filename)
+    source_msk = np.zeros(source_img.shape[:2], dtype=np.uint8)
+    logger.debug("source_msk.shape: '%s'" % str(source_msk.shape))
+
+  # if the image is multichannel, take only the first channel
+  if len(source_msk.shape) > 2:
+    logger.warning("'%s' has %i channels, reducing to first channel" % (filename, source_msk.shape[2]))
+    source_msk = source_msk.mean(axis=-1).astype(int)
+
+  source_msk = source_msk[..., np.newaxis]
+
+  # mask label values
+  labels = np.unique(source_msk)
+  logger.info("'%s':%s:%s labels: %s" % (filename, str(source_msk.shape), str(source_msk.dtype), labels))
+
+  for label in labels:
+    if label > max(colourmap.keys()):
+      logger.warning("label value %i exceeds colourmap range [%i,%i], %i is mapped to %i" % (
+          label, min(colourmap.keys()), max(colourmap.keys()), label, 1))
+      source_msk[source_msk==label] = 1
+
+  labels = np.unique(source_msk)
+  logger.info("'%s':%s:%s labels: %s" % (filename, str(source_msk.shape), str(source_msk.dtype), labels))
+
+  return source_msk.astype(np.float)
 
 
 if __name__ == "__main__":
@@ -178,22 +367,23 @@ if __name__ == "__main__":
   from glob import glob
   from os.path import exists
 
-  # setup logging
+  log_format = "[%(asctime)s] - %(name)s:%(lineno)d - %(levelname)s - %(message)s"
+
   root = logging.getLogger()
   root.setLevel(logging.DEBUG)
+  root.setLevel(os.getenv("LOG_LEVEL", "DEBUG"))
 
   ch = logging.StreamHandler(sys.stdout)
-  ch.setLevel(logging.DEBUG)
-  formatter = logging.Formatter("%(name)s:%(levelname)s:%(message)s")
+  formatter = logging.Formatter(log_format)
   ch.setFormatter(formatter)
   root.addHandler(ch)
 
   #global source_img, source_msk, display_img
 
   parser = argparse.ArgumentParser(description="Edit image masks. Images and masks are assumed to be aligned lists.")
-  parser.add_argument("-i", "--images", nargs="+", help="list or filename-pattern for images")
-  parser.add_argument("-m", "--masks", nargs="+", help="list or filename-pattern for masks")
-  parser.add_argument("--dry-run", action="store_true", dest="dryrun")
+  parser.add_argument("-i", "--images", required=True, nargs="+", help="list or filename-pattern for images")
+  parser.add_argument("-m", "--masks", required=True, nargs="+", help="list or filename-pattern for masks")
+  parser.add_argument("-n", "--dry-run", action="store_true", dest="dryrun")
   args = parser.parse_args()
 
   images = sorted(glob(*args.images))
@@ -209,7 +399,6 @@ if __name__ == "__main__":
   assert len(images) > 0
   assert len(images) == len(masks)
 
-
   if args.dryrun:
     for image_filename, mask_filename in zip(images, masks):
       logger.info("'%s', '%s'" % (image_filename, mask_filename))
@@ -220,21 +409,39 @@ if __name__ == "__main__":
   else:
     init()
 
+    processing_data = {}
+
     # edit the images
-    for image_filename, mask_filename in zip(images, masks):
-      # FIXME: take an MD5 of the mask contents and only save if the hash differs so we don't wreck timestamps
-      # FIXME: check for multi-class labels
-      source_img = cv.imread(image_filename).astype(np.float)/255.0
-#      source_msk = cv.imread(mask_filename).astype(np.float)/255.0
-      source_msk = (cv.imread(mask_filename) > 0).astype(np.float)
-      display_img = blend_in_channel(source_img, source_msk)
+    try:
+      for idx, (image_filename, mask_filename) in enumerate(zip(images, masks)):
+        # FIXME: take an MD5 of the mask contents and only save if the hash differs so we don't wreck timestamps
+        # FIXME: check for multi-class labels
+        source_img = read_image(image_filename)
+        source_msk = read_mask(mask_filename)
 
-      while(1):
-        on_draw()
-        cv.imshow("mask-edit", display_img)
-        k = cv.waitKey(1) & 0xFF
+        # create the initial display image
+        display_img = blend_with_colourmap(source_img, source_msk, np_colourmap)
+        logger.debug("display_img.shape: '%s'" % str(display_img.shape))
 
-        if on_keydown(k) is False:
-          logger.info("writing image to '%s' [%s]" % (mask_filename, str(np.ptp(source_msk))))
-          cv.imwrite(mask_filename, (source_msk[...,0] * 255.0).astype(np.uint8))
-          break
+        T0 = clock()
+
+        while(1):
+          on_draw(output_text=lambda: "[%i/%i] [%i]" % (idx, len(images), CURRENT_LABEL))
+
+          cv.imshow("mask-edit", display_img)
+          k = cv.waitKey(1) & 0xFF
+
+          if on_keydown(k) is False:
+            logger.info("writing image to '%s' [%s]" % (mask_filename, str(np.ptp(source_msk))))
+            cv.imwrite(mask_filename, source_msk.astype(int))
+            break
+
+        T1 = clock()
+        logger.info("'%s' in %0.2fs" % (basename(image_filename), (T1-T0)))
+        processing_data.update({basename(image_filename): {"time": T1-T0}})
+
+    except StopIteration as e:
+      logger.info("stopping")
+
+    # FIXME: write out the processing data for fun
+    # logger.info(json.dumps(processing_data, indent=2))
