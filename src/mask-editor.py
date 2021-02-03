@@ -10,6 +10,11 @@ from time import perf_counter as clock
 from os.path import basename
 from datetime import datetime
 
+from mask_stats import hash_np_array
+from undo import History
+from blends import alpha_blend, apply_colourmap
+
+
 # setup logging
 logger = logging.getLogger(__name__)
 
@@ -26,7 +31,7 @@ LABEL_BACKGROUND = 0
 SHAPE_COLOUR = (1.0, 1.0, 1.0)
 SHAPE_SIZE = 6
 SHAPE_SIZE_INC = 1
-BLEND_ALPHA = 0.75
+BLEND_ALPHA = 0.25
 MASK_THRESHOLD = 0.5
 DRAW_MODE = "point" # (point|line)
 
@@ -60,35 +65,6 @@ def init():
   """
   cv.namedWindow(WINDOW_TITLE)
   cv.setMouseCallback(WINDOW_TITLE, on_mousemove)
-
-
-def blend_images(img_a, img_b, alpha):
-  """
-  blend two images using opacity
-  """
-  return img_a * (1.0-alpha) + img_b * (alpha)
-
-
-def blend_in_channel(img_a, img_b):
-  """
-  creates a three channel image with:
-    channel 1: image_b[0],
-    channel 2: image_a[1]
-    channel 3: image_a[2]
-  opencv is bgr so this makes the blue channel of the colour image equal to the masks contents
-  """
-  return np.dstack([img_b[...,0], img_a[...,1], img_a[...,2]])
-
-
-def blend_with_colourmap(img_a, img_b, colourmap):
-  """
-  blends image and colourmap index to single image
-  img_a: float image of source value
-  img_b: float image of colourmap index
-  colourmap: map of index to colour
-  """
-  assert len(img_b.shape) == 3 and img_b.shape[-1] == 1, "img_b.shape: '%s'" % str(img_b.shape)
-  return blend_images(img_a, np_colourmap[img_b[:, :, 0].astype(int)], 0.5)
 
 
 def on_mousemove(event, x, y, flags, userparam):
@@ -204,11 +180,6 @@ def on_keydown(key):
     global CURRENT_LABEL
     global mouse_pos
 
-    im_mask = source_msk.copy().astype(np.uint8)
-#    mask=np.zeros((im_mask.shape[1]+2, im_mask.shape[0]+2), dtype=np.uint8)
-
-#    mask = (~(im_mask == CURRENT_LABEL)).astype(np.uint8)
-#    mask = cv.copyMakeBorder(mask,1,1,1,1,cv.BORDER_CONSTANT,value=0)
     im_mask = (source_msk==CURRENT_LABEL).astype(np.uint8)
     cv.floodFill(im_mask, None, mouse_pos, CURRENT_LABEL)
     source_msk[im_mask!=0] = CURRENT_LABEL
@@ -258,7 +229,8 @@ def on_draw(output_text):
 
   SHAPE_COLOUR = colourmap[CURRENT_LABEL]
 
-  display_img = blend_with_colourmap(source_img, source_msk, colourmap)
+  label_img = apply_colourmap(source_msk, np_colourmap)
+  display_img = alpha_blend(source_img, label_img, alpha=BLEND_ALPHA)
 
   # draw things on the display image to indicate whats happening
   if DRAW_MODE == "point":
@@ -332,7 +304,7 @@ def read_mask(filename):
 
   # multi-label images
   try:
-    source_msk = cv.imread(filename)
+    source_msk = cv.imread(filename, cv.IMREAD_ANYCOLOR)
   except FileNotFoundError as e:
     logger.warning("'%s' not found, creating empty" % filename)
     source_msk = np.zeros(source_img.shape[:2], dtype=np.uint8)
@@ -340,25 +312,27 @@ def read_mask(filename):
 
   # if the image is multichannel, take only the first channel
   if len(source_msk.shape) > 2:
-    logger.warning("'%s' has %i channels, reducing to first channel" % (filename, source_msk.shape[2]))
+    logger.warning("'%s'.shape = %s, reducing to first channel" % (basename(filename), str(source_msk.shape)))
     source_msk = source_msk.mean(axis=-1).astype(int)
 
   source_msk = source_msk[..., np.newaxis]
 
   # mask label values
   labels = np.unique(source_msk)
-  logger.info("'%s':%s:%s labels: %s" % (filename, str(source_msk.shape), str(source_msk.dtype), labels))
+  logger.info("'%s':%s:%s %i labels" % (basename(filename), str(source_msk.shape), str(source_msk.dtype), len(labels)))
 
-  for label in labels:
-    if label > max(colourmap.keys()):
-      logger.warning("label value %i exceeds colourmap range [%i,%i], %i is mapped to %i" % (
-          label, min(colourmap.keys()), max(colourmap.keys()), label, 1))
-      source_msk[source_msk==label] = 1
+  if any([label > max(colourmap.keys()) for label in labels]):
+    logger.warning("label values > colourmap range [%i, %i] are mapped to %i" % (
+        min(colourmap.keys()), max(colourmap.keys()), 1))
+
+    for label in labels:
+      if label > max(colourmap.keys()):
+        source_msk[source_msk==label] = 1
 
   labels = np.unique(source_msk)
-  logger.info("'%s':%s:%s labels: %s" % (filename, str(source_msk.shape), str(source_msk.dtype), labels))
+  logger.info("'%s':%s:%s labels: %s" % (basename(filename), str(source_msk.shape), str(source_msk.dtype), labels))
 
-  return source_msk.astype(np.float)
+  return source_msk.astype(float)
 
 
 if __name__ == "__main__":
@@ -377,8 +351,6 @@ if __name__ == "__main__":
   formatter = logging.Formatter(log_format)
   ch.setFormatter(formatter)
   root.addHandler(ch)
-
-  #global source_img, source_msk, display_img
 
   parser = argparse.ArgumentParser(description="Edit image masks. Images and masks are assumed to be aligned lists.")
   parser.add_argument("-i", "--images", required=True, nargs="+", help="list or filename-pattern for images")
@@ -414,14 +386,13 @@ if __name__ == "__main__":
     # edit the images
     try:
       for idx, (image_filename, mask_filename) in enumerate(zip(images, masks)):
-        # FIXME: take an MD5 of the mask contents and only save if the hash differs so we don't wreck timestamps
-        # FIXME: check for multi-class labels
         source_img = read_image(image_filename)
         source_msk = read_mask(mask_filename)
+        source_msk_hash = hash_np_array(source_msk)
+        logger.debug("'%s', mask_hash: '%s'" % (basename(image_filename), str(source_msk_hash)))
 
         # create the initial display image
-        display_img = blend_with_colourmap(source_img, source_msk, np_colourmap)
-        logger.debug("display_img.shape: '%s'" % str(display_img.shape))
+        display_img = np.zeros_like(source_img).astype(float)
 
         T0 = clock()
 
@@ -432,13 +403,18 @@ if __name__ == "__main__":
           k = cv.waitKey(1) & 0xFF
 
           if on_keydown(k) is False:
-            logger.info("writing image to '%s' [%s]" % (mask_filename, str(np.ptp(source_msk))))
-            cv.imwrite(mask_filename, source_msk.astype(int))
             break
 
         T1 = clock()
-        logger.info("'%s' in %0.2fs" % (basename(image_filename), (T1-T0)))
-        processing_data.update({basename(image_filename): {"time": T1-T0}})
+
+        # check for updates to the mask
+        output_msk_hash = hash_np_array(source_msk)
+        logger.debug("'%s', mask_hash: '%s' in %0.2fs" % (basename(image_filename), str(output_msk_hash), (T1-T0)))
+
+        if output_msk_hash != source_msk_hash:
+          logger.info("'%s': updating mask with %s" % (basename(image_filename), str(source_msk[:, :, 0].shape)))
+          cv.imwrite(mask_filename, source_msk[:, :, 0].astype(int))
+          processing_data.update({basename(image_filename): {"time": T1-T0}})
 
     except StopIteration as e:
       logger.info("stopping")
