@@ -421,3 +421,10 @@ if __name__ == "__main__":
 
     # FIXME: write out the processing data for fun
     # logger.info(json.dumps(processing_data, indent=2))
+
+    # do some stats
+    times = [stats["time"] for stats in processing_data.values() if "time" in stats]
+
+    total_time = sum(times)
+    average_time = total_time / len(times) if len(times) > 0 else 0.0
+    logger.info("session duration: %0.2fs, %i images, %0.2fs average per image" % (total_time, len(times), average_time))
