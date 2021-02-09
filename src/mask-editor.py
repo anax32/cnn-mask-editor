@@ -356,6 +356,7 @@ if __name__ == "__main__":
   parser.add_argument("-i", "--images", required=True, nargs="+", help="list or filename-pattern for images")
   parser.add_argument("-m", "--masks", required=True, nargs="+", help="list or filename-pattern for masks")
   parser.add_argument("-n", "--dry-run", action="store_true", dest="dryrun")
+  parser.add_argument("-s", "--start", type=int, default=0, help="index of the first image to start labelling")
   args = parser.parse_args()
 
   images = sorted(glob(*args.images))
@@ -372,7 +373,7 @@ if __name__ == "__main__":
   assert len(images) == len(masks)
 
   if args.dryrun:
-    for image_filename, mask_filename in zip(images, masks):
+    for image_filename, mask_filename in zip(images[args.start:], masks[args.start:]):
       logger.info("'%s', '%s'" % (image_filename, mask_filename))
       if exists(image_filename) is False:
         logger.error("'%s' not found" % image_filename)
@@ -385,7 +386,7 @@ if __name__ == "__main__":
 
     # edit the images
     try:
-      for idx, (image_filename, mask_filename) in enumerate(zip(images, masks)):
+      for idx, (image_filename, mask_filename) in enumerate(zip(images[args.start:], masks[args.start:])):
         source_img = read_image(image_filename)
         source_msk = read_mask(mask_filename)
         source_msk_hash = hash_np_array(source_msk)
@@ -397,7 +398,7 @@ if __name__ == "__main__":
         T0 = clock()
 
         while(1):
-          on_draw(output_text=lambda: "[%i/%i] [%i]" % (idx, len(images), CURRENT_LABEL))
+          on_draw(output_text=lambda: "[%i/%i] [%i]" % (args.start+idx, len(images), CURRENT_LABEL))
 
           cv.imshow("mask-edit", display_img)
           k = cv.waitKey(1) & 0xFF
