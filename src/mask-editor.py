@@ -11,7 +11,6 @@ from os.path import basename
 from datetime import datetime
 
 from mask_stats import hash_np_array
-from undo import History
 from blends import alpha_blend, apply_colourmap
 
 
